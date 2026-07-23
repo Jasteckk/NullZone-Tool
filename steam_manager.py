@@ -4,7 +4,7 @@
 import customtkinter as ctk
 import tkinter as tk
 import json, os, re, subprocess, sys, time, threading, base64, winreg
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageDraw
 import urllib.request, urllib.error, io, webbrowser
 
 ctk.set_appearance_mode("dark")
@@ -148,11 +148,16 @@ def compute_crc32(data):
 
 def parse_jwt(token):
     try:
+        # If token has extra data (----metadata or extra dots like .853Z timestamps),
+        # extract only the first 3 dot-separated segments which form the valid JWT.
         parts = token.split(".")
-        if len(parts) != 3: return None
+        if len(parts) < 3:
+            return None
+        parts = parts[:3]  # header, payload, signature only
         pad = 4 - len(parts[1]) % 4
         return json.loads(base64.urlsafe_b64decode(parts[1] + "=" * pad))
-    except: return None
+    except:
+        return None
 
 def steam64_from_token(token):
     p = parse_jwt(token)
@@ -458,22 +463,138 @@ def read_steam_accounts(steam_path):
         return results
     except: return []
 
-def do_login(account_name, token):
-    if "@" in account_name: account_name=account_name.split("@")[0]
-    payload=parse_jwt(token)
-    if not payload: raise Exception("Invalid JWT token")
-    steam_id=payload.get("sub",""); steam_path=find_steam()
-    if not steam_path: raise Exception("Steam not found")
-    kill_steam()
-    os.makedirs(os.path.join(steam_path,"config"),exist_ok=True)
+
+def write_invisible_localconfig(steam_path, steam_id):
+    """
+    Write PersonaState=7 to localconfig.vdf BEFORE Steam starts.
+    Returns the path so the caller can hold a lock on it.
+    """
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,r"SOFTWARE\Valve\Steam",0,winreg.KEY_SET_VALUE) as k:
-            winreg.SetValueEx(k,"AutoLoginUser",0,winreg.REG_SZ,account_name)
+        steamid3 = str(int(steam_id) - 76561197960265728)
+    except Exception:
+        return None
+    cfg_dir   = os.path.join(steam_path, 'userdata', steamid3, 'config')
+    local_cfg = os.path.join(cfg_dir, 'localconfig.vdf')
+    if not os.path.exists(cfg_dir):
+        return local_cfg   # return path so watcher can handle it later
+    try:
+        remove_readonly(local_cfg)
+        c = ''
+        if os.path.exists(local_cfg):
+            with open(local_cfg, 'r', encoding='utf-8', errors='replace') as f:
+                c = f.read()
+        if not c.strip():
+            c = ('"UserLocalConfigStore"\n{\n'
+                 '\t"friends"\n\t{\n'
+                 '\t\t"PersonaState"\t\t"7"\n'
+                 '\t}\n}\n')
+        else:
+            fm = re.search(r'"friends"\s*\{', c, re.IGNORECASE)
+            if fm:
+                pos = fm.end(); depth = 1; i = pos
+                while i < len(c) and depth > 0:
+                    if c[i] == '{': depth += 1
+                    elif c[i] == '}': depth -= 1
+                    i += 1
+                fe = i - 1; blk = c[pos:fe]
+                if re.search(r'"PersonaState"', blk, re.IGNORECASE):
+                    blk = re.sub(r'("PersonaState"\s+)"[^"]*"',
+                                 r'\g<1>"7"', blk, flags=re.IGNORECASE)
+                else:
+                    blk = blk.rstrip() + '\n\t\t"PersonaState"\t\t"7"\n\t\t'
+                c = c[:pos] + blk + c[fe:]
+            else:
+                close = c.rfind('}')
+                c = (c[:close] +
+                     '\n\t"friends"\n\t{\n\t\t"PersonaState"\t\t"7"\n\t}\n' +
+                     c[close:])
+        with open(local_cfg, 'w', encoding='utf-8') as f:
+            f.write(c)
+    except Exception:
+        pass
+    return local_cfg
+
+
+def do_login(account_name, token):
+    if "@" in account_name: account_name = account_name.split("@")[0]
+    payload = parse_jwt(token)
+    if not payload: raise Exception("Invalid JWT token")
+    steam_id   = payload.get("sub", "")
+    steam_path = find_steam()
+    if not steam_path: raise Exception("Steam not found")
+
+    kill_steam()
+    os.makedirs(os.path.join(steam_path, "config"), exist_ok=True)
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"SOFTWARE\Valve\Steam", 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "AutoLoginUser", 0, winreg.REG_SZ, account_name)
     except: pass
-    patch_config(os.path.join(steam_path,"config","config.vdf"),steam_id,account_name)
-    patch_loginusers(os.path.join(steam_path,"config","loginusers.vdf"),steam_id,account_name)
-    save_session_for(account_name,token); patch_local_vdf(account_name,token)
-    subprocess.Popen([os.path.join(steam_path,"steam.exe")],creationflags=0x00000008)
+
+    patch_config(os.path.join(steam_path,"config","config.vdf"), steam_id, account_name)
+    patch_loginusers(os.path.join(steam_path,"config","loginusers.vdf"), steam_id, account_name)
+    save_session_for(account_name, token)
+    patch_local_vdf(account_name, token)
+
+    # ── Write PersonaState=7 BEFORE Steam starts ──────────────
+    local_cfg = write_invisible_localconfig(steam_path, steam_id)
+
+    # ── Hold exclusive write lock on localconfig.vdf ──────────
+    # while Steam is starting so it cannot overwrite PersonaState
+    lock_handle = None
+    if local_cfg and os.path.exists(local_cfg):
+        try:
+            import win32file, win32con, pywintypes
+            lock_handle = win32file.CreateFile(
+                local_cfg,
+                win32con.GENERIC_READ | win32con.GENERIC_WRITE,
+                win32con.FILE_SHARE_READ,   # others can READ, not WRITE
+                None,
+                win32con.OPEN_EXISTING,
+                win32con.FILE_ATTRIBUTE_NORMAL,
+                None
+            )
+        except Exception:
+            lock_handle = None
+
+    # ── Launch Steam ──────────────────────────────────────────
+    subprocess.Popen([os.path.join(steam_path, "steam.exe")],
+                     creationflags=0x00000008)
+
+    # ── Background: hold lock + fire URL ─────────────────────
+    def _invisible_worker(lh=lock_handle, cfg=local_cfg):
+        def fire():
+            try:
+                subprocess.Popen(
+                    ['cmd', '/c', 'start', '', 'steam://friends/status/invisible'],
+                    creationflags=0x08000000)
+            except Exception:
+                try: os.startfile('steam://friends/status/invisible')
+                except: pass
+
+        # Fire URL every 400ms for 20 seconds as backup
+        for _ in range(50):
+            fire()
+            time.sleep(0.4)
+
+        # Release lock after 20 seconds
+        if lh:
+            try:
+                import win32file
+                win32file.CloseHandle(lh)
+            except Exception: pass
+
+        # Handle new account: wait for userdata to appear then write
+        if cfg and not os.path.exists(cfg):
+            for _ in range(60):
+                if os.path.exists(os.path.dirname(cfg)):
+                    write_invisible_localconfig(steam_path, steam_id)
+                    break
+                time.sleep(1)
+
+    threading.Thread(target=_invisible_worker, daemon=True).start()
+
 
 def load_accounts():
     if not os.path.exists(ACCOUNTS_FILE): return []
@@ -528,15 +649,6 @@ def get_steam_avatar(steam_id, size=56):
     except: pass
     return None
 
-def load_cooldown_icon(size=16):
-    """Load the cooldown icon image."""
-    p = resource("cooldown_icon.png")
-    if os.path.exists(p):
-        try:
-            img = Image.open(p).convert("RGBA").resize((size, size), Image.LANCZOS)
-            return ctk.CTkImage(img, size=(size, size))
-        except: pass
-    return None
 
 def load_logo_image(size=32):
     """Load NZ logo — scales to given size. Uses resource() for frozen exe."""
@@ -550,24 +662,29 @@ def load_logo_image(size=32):
     return None
 
 def load_cooldown_icon(size=14):
-    """Load cooldown icons as ImageTk.PhotoImage for tk.Label."""
+    """
+    Returns dict of ImageTk.PhotoImage keyed by state: none/active/expired.
+    Uses PIL point() for tinting — no numpy, no CTkImage, works with tk.Label.
+    Must be called after the Tk root exists.
+    """
+    from PIL import ImageTk
     icons = {}
     p = resource("cooldown_icon.png")
     if not os.path.exists(p):
         return icons
     try:
         base = Image.open(p).convert("RGBA")
+        # Use luminance as alpha so dark background becomes transparent
         lum = base.convert("L")
         base.putalpha(lum)
-
         for state, col in [("none",(60,60,60)),("active",(200,140,0)),("expired",(0,200,80))]:
-            grey_rgb = Image.merge("RGBA", [
-                lum.point(lambda p: int(p * col[0]/255)),
-                lum.point(lambda p: int(p * col[1]/255)),
-                lum.point(lambda p: int(p * col[2]/255)),
+            tinted = Image.merge("RGBA", [
+                lum.point(lambda v, c=col[0]: int(v * c / 255)),
+                lum.point(lambda v, c=col[1]: int(v * c / 255)),
+                lum.point(lambda v, c=col[2]: int(v * c / 255)),
                 lum,
             ])
-            resized = grey_rgb.resize((size,size), Image.LANCZOS)
+            resized = tinted.resize((size, size), Image.LANCZOS)
             icons[state] = ImageTk.PhotoImage(resized)
     except Exception:
         pass
@@ -608,7 +725,7 @@ class App(ctk.CTk):
         self.accounts     = load_accounts()
         self.avatar_cache = {}
         self._logo_img    = load_logo_image(32)
-        self._cd_icons    = load_cooldown_icon(22)
+        self._cd_icons    = load_cooldown_icon(14)
         self._cd_icon     = load_cooldown_icon(15)
         self.steam_path   = find_steam()
         self.steam_ok     = self.steam_path is not None
@@ -722,7 +839,7 @@ class App(ctk.CTk):
         ir.pack(fill="x", padx=12, pady=(0,10))
         self.token_var = ctk.StringVar()
         self.token_entry = ctk.CTkEntry(ir, textvariable=self.token_var,
-            placeholder_text="username----eyAi...  (or  username:eyAi...)",
+            placeholder_text="username----eyAi...,  steamid----eyAi...  (or  username:eyAi...)",
             fg_color=INPUT_BG, border_color=BORDER, border_width=1,
             text_color=TXT, placeholder_text_color=TXT3,
             font=(SF,11), height=40, corner_radius=8)
@@ -810,6 +927,12 @@ class App(ctk.CTk):
 
     def _run_check(self):
         token = self._chk_var.get().strip()
+        # Handle full lines with ---- separator (e.g. steamid----jwt----csgoRank:5----...)
+        if "----" in token:
+            # Extract the JWT (always the part between the first ---- and the second ----, or after the first ----)
+            token = token.split("----")[1] if token.count("----") >= 1 else token
+            # Also strip any trailing metadata after the JWT
+            token = token.split("----")[0]
         self._chk_status.configure(text="Checking…", text_color=TXT2)
         self._chk_dot.configure(text_color="#555555")
         self._chk_detail.configure(text="")
@@ -975,7 +1098,7 @@ class App(ctk.CTk):
 
         dots = tk.Label(card, text="⋯", bg=CARD_BG, fg="#555555",
                         activebackground=CARD_HOV, activeforeground="#aaaaaa",
-                        font=(SF,14), cursor="hand2", bd=0, padx=3, pady=0)
+                        font=(SF,12), cursor="hand2", bd=0, padx=3, pady=0)
         dots.place(relx=1.0, rely=0.0, x=-4, y=5, anchor="ne")
         dots.bind("<Button-1>", show_menu)
 
@@ -1006,22 +1129,77 @@ class App(ctk.CTk):
     def _quick_login(self):
         raw = self.token_var.get().strip()
         if not raw: self._toast("Paste a token first", err=True); return
-        if "----" in raw: username,token=raw.split("----",1)
-        elif ":" in raw and not raw.startswith("eyJ"): username,token=raw.split(":",1)
+
+        if "----" in raw:
+            identifier, token = raw.split("----", 1)
+            # Strip any extra metadata appended after the JWT (e.g. ----csgoRank:5----...)
+            token = token.split("----")[0]
+        elif ":" in raw and not raw.startswith("eyJ"):
+            identifier, token = raw.split(":", 1)
         else:
-            p=parse_jwt(raw); username=p.get("sub","account")[:8] if p else "account"; token=raw
-        username=username.strip(); token=token.strip()
-        existing=next((a for a in self.accounts if a.get("username")==username),None)
-        if existing:
-            existing["token"]=token; existing.pop("noToken",None)
-            save_accounts(self.accounts); acc=existing
+            # Bare JWT — use sub[:8] as username
+            p = parse_jwt(raw)
+            username = p.get("sub", "account")[:8] if p else "account"
+            token = raw
+            identifier = username
+
+        identifier = identifier.strip()
+        token = token.strip()
+
+        # ── SteamID64 mode (identifier is a 17-digit SteamID starting with 7656) ──
+        if len(identifier) == 17 and identifier.startswith("7656") and identifier.isdigit():
+            payload = parse_jwt(token)
+            if not payload:
+                self._toast("Invalid JWT token", err=True); return
+            resolved_steam_id = identifier
+            resolved_username = payload.get("sub", "")
+
+            # Look for existing account by steamId (not by username) — avoids duplicates
+            existing = next((a for a in self.accounts if a.get("steamId") == resolved_steam_id), None)
+            if existing:
+                existing["token"] = token
+                existing["username"] = resolved_username
+                existing["displayName"] = resolved_username
+                existing.pop("noToken", None)
+                save_accounts(self.accounts)
+                acc = existing
+            else:
+                acc = {
+                    "id": str(int(time.time()*1000)),
+                    "username": resolved_username,
+                    "displayName": resolved_username,
+                    "token": token,
+                    "steamId": resolved_steam_id,
+                    "addedAt": int(time.time())
+                }
+                self.accounts.append(acc)
+                save_accounts(self.accounts)
+
+        # ── Username mode (original behaviour) ──
         else:
-            acc={"id":str(int(time.time()*1000)),"username":username,"displayName":username,
-                 "token":token,"steamId":steam64_from_token(token),"addedAt":int(time.time())}
-            self.accounts.append(acc); save_accounts(self.accounts)
+            username = identifier
+            existing = next((a for a in self.accounts if a.get("username") == username), None)
+            if existing:
+                existing["token"] = token
+                existing.pop("noToken", None)
+                save_accounts(self.accounts)
+                acc = existing
+            else:
+                acc = {
+                    "id": str(int(time.time()*1000)),
+                    "username": username,
+                    "displayName": username,
+                    "token": token,
+                    "steamId": steam64_from_token(token),
+                    "addedAt": int(time.time())
+                }
+                self.accounts.append(acc)
+                save_accounts(self.accounts)
+
         self.token_var.set("")
-        threading.Thread(target=save_session_for,args=(username,token),daemon=True).start()
-        self._render(); self._login(acc)
+        threading.Thread(target=save_session_for, args=(acc["username"], token), daemon=True).start()
+        self._render()
+        self._login(acc)
 
     def _login(self, acc):
         if not self.steam_ok: self._toast("Steam not found",err=True); return
